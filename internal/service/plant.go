@@ -92,6 +92,7 @@ func NewPlant(dataDir string) *Plant {
 		Incidents:         NewIncidents(),
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
+	store.AttachSink(plant.FileLog.Append)
 	plant.Feed.Observe = plant.observeFeed
 	return plant
 }
@@ -254,6 +255,13 @@ func (p *Plant) Restore() error {
 	if err != nil {
 		return err
 	}
+	// Replay the durable event log back into the in-memory journal so the
+	// release basis (proof.durable) recorded before the restart can be
+	// re-verified. A read failure leaves the journal empty, which forces any
+	// captured product route to stay closed for lack of evidence.
+	if events, readErr := p.FileLog.Read(); readErr == nil {
+		p.Journal.Load(events)
+	}
 	campaign.Restore(p.Campaign, snapshot.Campaign)
 	column.Restore(p.Column, snapshot.Column)
 	if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
@@ -268,7 +276,28 @@ func (p *Plant) Restore() error {
 	if !model.PhaseAllowsHeat(snapshot.Campaign.Phase) {
 		p.Reboiler.Stop()
 	}
+	p.restoreProductRoute(snapshot)
 	return nil
+}
+
+// restoreProductRoute re-establishes the product destination captured in the
+// snapshot, but only re-opens it when durable release evidence survives in the
+// recovered journal. Otherwise the route stays closed and the reason is recorded
+// so operators can see why production is not feeding a target tank.
+func (p *Plant) restoreProductRoute(snapshot model.Snapshot) {
+	target := ""
+	if len(snapshot.Products) > 0 {
+		target = snapshot.Products[0]
+	}
+	plan := model.ProductPlan{Campaign: snapshot.Campaign.ID, Revision: snapshot.Campaign.Revision, Grade: snapshot.Campaign.Grade, Target: target}
+	outcome := product.RestoreRouteFromSnapshot(p.Product, plan, p.Journal.Events(), p.ProductAudit)
+	if outcome.Target == "" || outcome.Opened {
+		return
+	}
+	p.mu.Lock()
+	p.lastError = outcome.Reason
+	p.mu.Unlock()
+	p.Incidents.Open("product-recovery", outcome.Reason, snapshot.Campaign.Revision.String())
 }
 
 func (p *Plant) ProductTargets() []string {
@@ -291,9 +320,6 @@ func (p *Plant) record(kind, payload string) error {
 	event := model.NewEvent(kind, p.Campaign.Snapshot(), payload)
 	event.At = time.Now().UnixNano()
 	if err := p.Journal.Append(event); err != nil {
-		return err
-	}
-	if err := p.FileLog.Append(event); err != nil {
 		return err
 	}
 	return p.Save()
