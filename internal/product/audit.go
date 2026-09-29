@@ -49,4 +49,10 @@ func (a *Audit) ForRevision(revision string) []Decision {
 	return out
 }
 
+func (a *Audit) All() []Decision {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]Decision(nil), a.decisions...)
+}
+
 func (a *Audit) Count() int { a.mu.Lock(); defer a.mu.Unlock(); return len(a.decisions) }

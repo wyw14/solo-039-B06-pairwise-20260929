@@ -70,12 +70,20 @@ type Event struct {
 	At       int64
 }
 
+type ProductRoute struct {
+	Target   string
+	Revision uuid.UUID
+	Grade    string
+	Opened   bool
+}
+
 type Snapshot struct {
 	Campaign Campaign
 	Column   Column
 	Reflux   Reflux
 	Reboiler Reboiler
 	Products []string
+	Product  ProductRoute
 	Relief   Relief
 }
 

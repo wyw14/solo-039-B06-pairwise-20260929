@@ -3,7 +3,6 @@ package product
 import (
 	"errors"
 	"github.com/wyw14/solo-039/internal/interlock"
-	"github.com/wyw14/solo-039/internal/journal"
 	"github.com/wyw14/solo-039/internal/model"
 )
 
@@ -32,7 +31,7 @@ func PublishGradeTransition(coordinator *Coordinator, plan model.ProductPlan, re
 	if refluxProof.Revision != plan.Revision || refluxProof.Digest == "" {
 		return errors.New("reflux proof belongs to another generation")
 	}
-	if err := journal.PersistProof(coordinator.Journal, refluxProof, coordinator.Campaign.Snapshot()); err != nil {
+	if err := coordinator.persistProof(refluxProof); err != nil {
 		return err
 	}
 	coordinator.proof = refluxProof

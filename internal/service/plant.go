@@ -93,6 +93,9 @@ func NewPlant(dataDir string) *Plant {
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
 	plant.Feed.Observe = plant.observeFeed
+	plant.Product.OnPersist = func(event model.Event) error {
+		return plant.FileLog.Append(event)
+	}
 	return plant
 }
 
@@ -244,7 +247,8 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
-	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot()}
+	current := p.Campaign.Snapshot()
+	return model.Snapshot{Campaign: current, Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Product: p.Product.Route.Snapshot(current.Grade), Relief: p.Relief.State.Snapshot()}
 }
 
 func (p *Plant) Save() error { return p.Snapshots.Save(p.Snapshot()) }
@@ -254,14 +258,33 @@ func (p *Plant) Restore() error {
 	if err != nil {
 		return err
 	}
+	// Replay the durable event log into the in-memory journal first so every
+	// evidence check below works against the plant's actual history rather
+	// than an empty store. This is a boot-time hydration, so skip it when the
+	// journal already holds events to keep Restore idempotent.
+	if len(p.Journal.Events()) == 0 {
+		durableEvents, err := p.FileLog.Read()
+		if err != nil {
+			return err
+		}
+		for _, event := range durableEvents {
+			if err := p.Journal.Append(event); err != nil {
+				return err
+			}
+		}
+	}
 	campaign.Restore(p.Campaign, snapshot.Campaign)
 	column.Restore(p.Column, snapshot.Column)
 	if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
 		return err
 	}
-	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
+	// Sequence and freshness checks apply to the current campaign; older
+	// campaigns in the same log legitimately restart their epoch counter.
+	campaignEvents := journal.RecoveryEvents(p.Journal, snapshot.Campaign.ID.String())
+	if err := journal.ValidateRecovery(snapshot, campaignEvents); err != nil {
 		return err
 	}
+	p.restoreProductRoute(snapshot)
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped
 	p.mu.Unlock()
@@ -269,6 +292,52 @@ func (p *Plant) Restore() error {
 		p.Reboiler.Stop()
 	}
 	return nil
+}
+
+// restoreProductRoute reinstates the running product route only when durable
+// journal evidence backs it. When the release proof (or the routing decision
+// itself) is missing, the route stays closed and the reason is recorded in the
+// product audit and as an open incident.
+func (p *Plant) restoreProductRoute(snapshot model.Snapshot) {
+	routeSnapshot := snapshot.Product
+	// Backward compatibility with older snapshots that only recorded target names.
+	if routeSnapshot.Target == "" && !routeSnapshot.Opened && len(snapshot.Products) > 0 {
+		routeSnapshot.Target = snapshot.Products[0]
+		routeSnapshot.Revision = snapshot.Campaign.Revision
+		routeSnapshot.Grade = snapshot.Campaign.Grade
+		routeSnapshot.Opened = true
+	}
+	// A route that was closed before the restart simply stays closed; no
+	// evidence is required.
+	if !routeSnapshot.Opened {
+		p.Product.Route.Close()
+		return
+	}
+	revision := snapshot.Campaign.Revision
+	plan := model.ProductPlan{Campaign: snapshot.Campaign.ID, Revision: revision, Grade: snapshot.Campaign.Grade, Target: routeSnapshot.Target}
+	recovery := product.BuildRecovery(p.Journal.Events(), p.ProductAudit)
+	restoreErr := product.RestoreRoute(p.Product, plan, recovery)
+	proof := model.Proof{Revision: revision}
+	if digest, ok := journal.ProofDigest(p.Journal, revision.String()); ok {
+		proof.Digest = digest
+		proof.Durable = true
+	}
+	switch {
+	case restoreErr == nil && p.Product.Route.Opened():
+		restoredPlan := model.ProductPlan{Campaign: snapshot.Campaign.ID, Revision: revision, Grade: snapshot.Campaign.Grade, Target: p.Product.Route.Target()}
+		p.ProductAudit.Record(restoredPlan, proof, true, "route restored from durable proof")
+	case restoreErr == nil:
+		// No route was ever durably opened for this generation; closed is correct.
+		p.Product.Route.Close()
+	default:
+		p.Product.Route.Close()
+		reason := "product route held closed after recovery: " + restoreErr.Error()
+		p.ProductAudit.Record(plan, proof, false, reason)
+		p.Incidents.Open("product-recovery", reason, revision.String())
+		p.mu.Lock()
+		p.lastError = reason
+		p.mu.Unlock()
+	}
 }
 
 func (p *Plant) ProductTargets() []string {

@@ -194,7 +194,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 	productDurable := productRecovery.Durable(revision)
 	productRouted := productRecovery.Routed(revision)
 	productRecoveryErr := productRecovery.Validate(revision)
-	productRestoreErr := product.RestoreRoute(productCoordinator, plan, productStore, productRecovery)
+	productRestoreErr := product.RestoreRoute(productCoordinator, plan, productRecovery)
 	productLatest, productLatestErr := p.ProductAudit.Latest()
 	productByRevision := p.ProductAudit.ForRevision(revision)
 	productState := product.NewState()

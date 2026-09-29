@@ -5,21 +5,30 @@ import (
 	"github.com/wyw14/solo-039/internal/model"
 )
 
-func PersistProof(store *Store, proof model.Proof, campaign model.Campaign) error {
-	if proof.Digest == "" {
-		proof.Digest = model.ProofDigest(proof)
+// proofEvent returns the durable proof event for the given revision anywhere
+// in the journal, not just the most recent one: a newer generation must not
+// erase evidence recorded for an earlier product route.
+func proofEvent(store *Store, revision string) (model.Event, bool) {
+	for _, event := range store.Events() {
+		if event.Kind == "proof.durable" && event.Revision.String() == revision && event.Payload != "" {
+			return event, true
+		}
 	}
-	event := model.NewEvent("proof.durable", campaign, proof.Digest)
-	if err := store.Append(event); err != nil {
-		return err
+	return model.Event{}, false
+}
+
+func RequireProof(store *Store, revision string) error {
+	if _, ok := proofEvent(store, revision); !ok {
+		return errors.New("proof is not durable")
 	}
 	return nil
 }
 
-func RequireProof(store *Store, revision string) error {
-	event, ok := store.Last("proof.durable")
-	if !ok || event.Revision.String() != revision {
-		return errors.New("proof is not durable")
+// ProofDigest returns the recorded digest of the durable proof for revision.
+func ProofDigest(store *Store, revision string) (string, bool) {
+	event, ok := proofEvent(store, revision)
+	if !ok {
+		return "", false
 	}
-	return nil
+	return event.Payload, true
 }
